@@ -741,6 +741,56 @@ async function handleQueueApi(request) {
   }
 }
 
+// ---------------- 歌词 ----------------
+// 宿主 stores/lyric.ts:lines[].time 单位为「秒」,currentTimeOffset 单位为「毫秒」。
+// 歌词内容与当前行索引都由宿主常驻维护(与歌词页是否打开无关),插件只读不写。
+// 用 ctx.lyric 原始 store 而非 ctx.lyrics.getSnapshot(),是为了走和 ctx.player 一致的零 IPC 快速路径。
+function lyricStoreOf() {
+  return ctx.lyric || ctx.stores?.lyric || null;
+}
+
+function handleLyricApi(request) {
+  try {
+    const store = lyricStoreOf();
+    if (!store) return jsonResponse({ ok: false, error: "当前宿主版本不支持歌词接口" }, 501);
+    const query = request.query || {};
+    const timeOffset = Number(store.currentTimeOffset) || 0;
+
+    // 轻量轮询:只用于判断「换歌了」或「歌词从加载中变为已就绪」,不含歌词正文
+    if (String(query.meta ?? "") === "1") {
+      return jsonResponse({
+        ok: true,
+        meta: true,
+        hash: String(store.loadedHash || ""),
+        total: Array.isArray(store.lines) ? store.lines.length : 0,
+        timeOffset,
+      });
+    }
+
+    const raw = Array.isArray(store.lines) ? store.lines : [];
+    const lines = [];
+    for (const item of raw) {
+      const text = String(item?.text ?? "").trim();
+      if (!text) continue; // 空行(LRC 元数据行、纯间奏占位)不占版面
+      lines.push({
+        time: Number(item?.time) || 0,
+        text,
+        translated: item?.translated ? String(item.translated).trim() : "",
+      });
+    }
+    return jsonResponse({
+      ok: true,
+      hash: String(store.loadedHash || ""),
+      tips: String(store.tips || ""),
+      total: raw.length,
+      timeOffset,
+      lines,
+    });
+  } catch (err) {
+    return jsonResponse({ ok: false, error: String(err?.message || err) }, 500);
+  }
+}
+
 async function runCommand(cmd) {
   const action = String(cmd.action || "");
   switch (action) {
@@ -814,6 +864,7 @@ async function handleRequest(request) {
       if (path === "/api/cover") return await coverResponse();
       if (path === "/api/search") return await handleSearchApi(request);
       if (path === "/api/queue") return await handleQueueApi(request);
+      if (path === "/api/lyric") return handleLyricApi(request);
     }
     if (isBridgeReport) {
       const body = await readJsonBody(request);
@@ -925,12 +976,56 @@ input[type=range]:disabled{opacity:.35}
 .qtime{font-size:11px;color:var(--text2);font-variant-numeric:tabular-nums;flex:none}
 .qrow.flash{animation:qflash .9s ease}
 @keyframes qflash{0%{background:rgba(255,255,255,.18)}100%{background:transparent}}
+.lrow{padding:9px 2px;color:var(--text2);font-size:14px;line-height:1.45;text-align:center;overflow-wrap:anywhere;transition:color .2s ease,font-size .2s ease}
+.lrow.cur{color:var(--accent);font-weight:700;font-size:16px}
+.lrow .lsub{display:block;margin-top:3px;font-size:12px;font-weight:400;color:var(--text2);opacity:.8}
+.lrow.cur .lsub{color:var(--accent);opacity:.72}
+.lrow.flash{animation:qflash .9s ease}
+.lnote{text-align:center;color:var(--text2);font-size:13px;line-height:1.8;padding:40px 24px}
+/* 上下留白让首行/末行也能滚到正中。留白高度必须跟着滚动容器走:
+   滚动容器不是整屏(并排右列只占一部分高),用 vh/百分比都会偏,
+   所以两种形态都由 JS 在居中前写入按容器实测高度算出的 --lpad。
+   窄屏时 .sbody 自己就是滚动容器,内边距直接生效;并排时内边距要挂到外层 .col-lyric 上。 */
+#lyricBody{padding-top:var(--lpad,45vh);padding-bottom:var(--lpad,45vh)}
+body.lyric-side .col-lyric #lyricBody{padding-top:0;padding-bottom:0}
+/* 够宽(≥640px,含手机横屏)就把歌词改成贴在封面右侧:
+   由 JS 给 body 加 .lyric-side 切换,不用媒体查询,避免两处判定不一致 */
+.col-main{display:contents}
+.col-lyric{display:none}
+/* 歌词的滚动容器随宿主切换:窄屏是 .lyric-pane(标题栏固定在顶),
+   宽屏是右侧整列 .col-lyric(标题栏绝对定位在顶)。两者共用同一套滚动规则,
+   所以滚动能力不写在 #lyricBody 上,而是写在「谁在承载它」上——避免两处写一份而漂移。 */
+.lyric-pane{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0}
+body:not(.lyric-side) .lyric-pane{overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+/* 并排时把 pane 拆掉(display:contents):窄屏那层的 flex 容器在宽屏里会多出一层
+   高度约束,导致内层留白撑不出滚动量,当前行永远滚不到正中。 */
+body.lyric-side .col-lyric .lyric-pane{display:contents}
+body.lyric-side .wrap{flex-direction:row;align-items:center;gap:clamp(12px,2.4vw,26px);width:min(1140px,96vw);padding:0}
+/* 640px 起就要并排,所以两列都用比例而非固定值:封面列占 38% 封顶 400px,
+   剩下给歌词列,窄屏时自动收窄,不会把封面挤成条。 */
+body.lyric-side .col-main{display:flex;flex-direction:column;align-items:center;gap:14px;width:min(400px,38vw);flex:none;max-height:calc(100vh - 16px);overflow-y:auto;overscroll-behavior:contain;padding:2px}
+body.lyric-side .cover{width:min(300px,30vh,86%)}
+/* 并排右列:外层只负责画底色和定高,不滚动;内部拆成「固定标题栏 + 独立滚动正文」两层。
+   不要用 overflow 外层 + sticky 标题栏:sticky 的吸附基准是最近的滚动祖先,
+   中间隔一层 display:contents 时吸附位置不可靠,标题栏会浮到内容中间压住歌词。 */
+body.lyric-side .col-lyric{position:relative;display:block;flex:1;min-width:0;height:calc(100vh - 16px);max-height:900px;background:rgba(15,17,21,.5);border-radius:20px;overflow:hidden}
+body.lyric-side .col-lyric .sbar{position:absolute;top:0;left:0;right:0;z-index:2;padding:14px 14px 8px;background:linear-gradient(180deg,rgba(11,14,18,.97),rgba(11,14,18,.9) 78%,rgba(11,14,18,0))}
+/* 正文本体负责滚动,并从标题栏下方开始。
+   注意:基础 .sbody 是 position:relative,这里改成 absolute 后必须把四边重新钉死,
+   否则绝对定位元素会按内容撑高(clientHeight === scrollHeight),看着「有 overflow:auto」
+   实际根本不滚,当前行也永远居中不了。top:58px 是给标题栏让位。 */
+body.lyric-side .col-lyric .sbody{position:absolute;top:58px;left:0;right:0;bottom:0;padding:0 14px;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-width:none}
+/* 并排态不显示滚动条(右侧那条可拖动的条):标准属性 + Blink/WebKit 双保险 */
+body.lyric-side .col-lyric .sbody::-webkit-scrollbar{display:none}
+/* 并排时真正的滚动容器就是 .sbody 自己,留白直接挂在它身上 */
+body.lyric-side .col-lyric .sbody#lyricBody{padding-top:var(--lpad,45vh);padding-bottom:var(--lpad,45vh)}
 </style>
 </head>
 <body>
 <div class="bg" id="bg"></div>
 <div class="wrap">
-  <div class="top"><span class="brand">ECHOREMOTE</span><span class="topR"><button class="sbtn" id="queueBtn" aria-label="播放队列"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg></button><button class="sbtn" id="searchBtn" aria-label="点歌"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button><span class="dot" id="dot"><i></i><span id="dotText">连接中…</span></span></span></div>
+  <div class="col-main">
+  <div class="top"><span class="brand">ECHOREMOTE</span><span class="topR"><button class="sbtn" id="lyricBtn" aria-label="歌词" title="歌词"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h3"/></svg></button><button class="sbtn" id="queueBtn" aria-label="播放队列" title="播放列表"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg></button><button class="sbtn" id="searchBtn" aria-label="点歌" title="点歌"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button><span class="dot" id="dot"><i></i><span id="dotText">连接中…</span></span></span></div>
   <div class="cover"><img id="cover" alt="封面" draggable="false"></div>
   <div class="meta"><div class="title" id="title">未在播放</div><div class="artist" id="artist">打开 EchoMusic 播放点什么吧</div></div>
   <div class="progress">
@@ -952,6 +1047,9 @@ input[type=range]:disabled{opacity:.35}
     <button class="chip" id="rateBtn" title="切换倍速">1.0x</button>
   </div>
   <div class="foot" id="foot">EchoMusic · LAN</div>
+  </div>
+  <div class="col-lyric" id="lyricSide"></div>
+</div>
 </div>
 <div class="panel" id="searchPanel">
   <div class="sbar">
@@ -970,6 +1068,18 @@ input[type=range]:disabled{opacity:.35}
     <button class="scancel" id="queueCancel">关闭</button>
   </div>
   <div class="sbody" id="queueBody"><div class="shint">加载中…</div></div>
+</div>
+<div>
+<div class="panel" id="lyricPanel">
+  <div class="lyric-pane" id="lyricPane">
+  <div class="sbar" id="lyricBar">
+    <span class="qtitle">歌词</span>
+    <button class="sbtn" id="lyricLocate" aria-label="定位到当前播放" title="定位到当前播放"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></button>
+    <button class="scancel" id="lyricCancel">关闭</button>
+  </div>
+  <div class="sbody" id="lyricBody"><div class="shint">加载中…</div></div>
+  </div>
+</div>
 </div>
 <script>
 var qs='';
@@ -1001,6 +1111,8 @@ function render(){
   var p=state?state.playback:null;
   if(state&&state.accentColor){document.documentElement.style.setProperty('--accent',state.accentColor);}
   if(p){
+    var tid=String(p.trackId||'');
+    if(tid!==lTrackId){lTrackId=tid;if(lOpen)loadLyric();}
     $('title').textContent=p.title||'未知歌曲';
     $('artist').textContent=[p.artist,p.album].filter(Boolean).join(' · ');
     $('dur').textContent=fmt(p.duration);
@@ -1035,13 +1147,65 @@ function render(){
     $('modeBtn').textContent=MODE_LABELS[state&&state.playMode]||'列表循环';
   }
 }
+// ---- WebSocket 通道(经桥接层 /ws 终结;桥轮询插件并推送,命令反向转发) ----
+// 桥不支持 /ws(旧版二进制未替换)或连接中断时,自动退回 HTTP 轮询,页面不会僵死。
+var ws=null,wsRetryTimer=null,wsRetryDelay=500,wsCmdId=0,wsPending={},wantQueue=false,wantLyric=false,fbTimer=null;
+function wsOpen(){return ws&&ws.readyState===1;}
+function wsSend(o){if(wsOpen()){try{ws.send(JSON.stringify(o));}catch(e){}}}
+function fallbackPoll(on){
+  if(on&&!fbTimer){fbTimer=setInterval(refresh,500);}
+  if(!on&&fbTimer){clearInterval(fbTimer);fbTimer=null;}
+}
+function wsConnect(){
+  clearTimeout(wsRetryTimer);
+  try{ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws'+qs);}
+  catch(e){wsRetry();return;}
+  ws.onopen=function(){wsRetryDelay=500;fallbackPoll(false);syncSubs();};
+  ws.onmessage=function(ev){
+    var m;try{m=JSON.parse(ev.data);}catch(e){return;}
+    if(!m||typeof m.t!=='string')return;
+    if(m.t==='state'){
+      if(m.data&&typeof m.data==='object'){state=m.data;setOnline(true);render();}
+      else{setOnline(false);}
+    }else if(m.t==='queueMeta'){queueMetaIn(m.data);}
+    else if(m.t==='lyricMeta'){lyricMetaIn(m.data);}
+    else if(m.t==='cmdres'){
+      var cb=wsPending[m.id];
+      if(cb){delete wsPending[m.id];cb(m.data);}
+    }
+  };
+  ws.onclose=function(){setOnline(false);fallbackPoll(true);syncSubs();wsRetry();};
+  ws.onerror=function(){};
+}
+function wsRetry(){
+  clearTimeout(wsRetryTimer);
+  wsRetryTimer=setTimeout(wsConnect,wsRetryDelay);
+  wsRetryDelay=Math.min(wsRetryDelay*2,5000);
+}
+// 面板开关只改「想要什么」;syncSubs 统一决定走 WS 订阅还是 HTTP 兜底轮询
+function syncSubs(){
+  if(wsOpen()){
+    if(qTimer){clearInterval(qTimer);qTimer=null;}
+    if(lTimer){clearInterval(lTimer);lTimer=null;}
+    wsSend({t:wantQueue?'sub':'unsub',topic:'queue'});
+    wsSend({t:wantLyric?'sub':'unsub',topic:'lyric'});
+  }else{
+    if(wantQueue&&!qTimer){qTimer=setInterval(queueSync,2000);}
+    if(!wantQueue&&qTimer){clearInterval(qTimer);qTimer=null;}
+    if(wantLyric&&!lTimer){lTimer=setInterval(lyricSync,2000);}
+    if(!wantLyric&&lTimer){clearInterval(lTimer);lTimer=null;}
+  }
+}
 function post(action,data,opts){
   var body=Object.assign({action:action},data||{});
+  if(wsOpen()){wsSend({t:'cmd',body:body});return;}
   fetch('/api/command'+qs,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body),cache:'no-store'}).catch(function(){});
   if(!opts||!opts.noRefresh){quickRefresh();}
 }
 var quickTimer=null,quickLeft=0;
 function quickRefresh(){
+  // WS 模式下命令落地后桥会立即补推一轮 state,无需 HTTP 补拉
+  if(wsOpen())return;
   quickLeft=3;
   if(quickTimer) return;
   (function burst(){
@@ -1069,6 +1233,7 @@ function raf(ts){
     $('cur').textContent=fmt(displayTime);
     paint(el,displayTime/p.duration*100);
   }
+  if(lOpen)lyricTick(ts);
   requestAnimationFrame(raf);
 }
 $('toggle').addEventListener('click',tapOnce(function(){
@@ -1122,7 +1287,7 @@ var sPage=1,sHasMore=false,sLoading=false,sKeyword='',sPlayingId='';
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 var COVER_FALLBACK='data:image/svg+xml,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><rect width="48" height="48" fill="rgba(255,255,255,.06)"/><circle cx="24" cy="24" r="10" fill="rgba(255,255,255,.14)"/></svg>');
 function covFallback(img){img.onerror=null;img.src=COVER_FALLBACK;}
-function openSearch(){panel.classList.add('show');setTimeout(function(){try{sInput.focus();}catch(e){}},150);}
+function openSearch(){closeQueue();closeLyric();panel.classList.add('show');setTimeout(function(){try{sInput.focus();}catch(e){}},150);}
 function closeSearch(){panel.classList.remove('show');try{sInput.blur();}catch(e){}refresh();}
 function markPlaying(id){
   sPlayingId=String(id||'');
@@ -1199,30 +1364,40 @@ var qPanel=$('queuePanel'),qBody=$('queueBody');
 var qStart=0,qEnd=0,qTotal=0,qLoaded=false,qLoading=false,qTimer=null,qQueueId='',qCurrentId='',qCurrentRel=-1;
 var PLAY_SM='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
 function postAsync(body){
+  if(wsOpen()){
+    // WS 模式:命令带自增 id,桥回 cmdres 按 id 关联(10s 超时兜底)
+    return new Promise(function(resolve){
+      var id=++wsCmdId;
+      var to=setTimeout(function(){delete wsPending[id];resolve({ok:false,error:'响应超时'});},10000);
+      wsPending[id]=function(d){clearTimeout(to);resolve(d||{ok:false,error:'空响应'});};
+      wsSend({t:'cmd',id:id,body:body});
+    });
+  }
   return fetch('/api/command'+qs,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body),cache:'no-store'})
     .then(function(r){return r.json();})
     .catch(function(){return {ok:false,error:'网络错误'};});
 }
-function openQueue(){qPanel.classList.add('show');loadQueueAround();startQueueSync();}
-function closeQueue(){stopQueueSync();qPanel.classList.remove('show');refresh();}
-function startQueueSync(){stopQueueSync();qTimer=setInterval(queueSync,2000);}
-function stopQueueSync(){if(qTimer){clearInterval(qTimer);qTimer=null;}}
-// 与 PC 端保持同步:切歌只更新高亮,队列内容变了才重新加载并定位
+function openQueue(){closeSearch();closeLyric();qPanel.classList.add('show');loadQueueAround();startQueueSync();}
+function closeQueue(){stopQueueSync();qPanel.classList.remove('show');}
+function startQueueSync(){wantQueue=true;syncSubs();}
+function stopQueueSync(){wantQueue=false;syncSubs();}
+// HTTP 兜底轮询(桥不支持 WS 时才走);WS 模式下由桥的 queueMeta 推送驱动
 function queueSync(){
-  if(!qPanel.classList.contains('show')){stopQueueSync();return;}
   fetch('/api/queue?meta=1'+qs,{cache:'no-store'})
     .then(function(r){return r.json();})
-    .then(function(d){
-      if(!d.ok||!d.meta)return;
-      if(String(d.queueId)!==qQueueId||d.total!==qTotal){loadQueueAround();return;}
-      var id=String(d.currentTrackId||'');
-      if(id===qCurrentId)return;
-      qCurrentId=id;
-      var target=d.currentIndex-qStart;
-      if(id&&target>=0&&target<qBody.children.length){qCurrentRel=target;markCurrent(id);}
-      else{loadQueueAround();}
-    })
+    .then(queueMetaIn)
     .catch(function(){});
+}
+// 与 PC 端保持同步:切歌只更新高亮,队列内容变了才重新加载并定位(WS 推送与兜底轮询共用入口)
+function queueMetaIn(d){
+  if(!d||!d.ok||!d.meta)return;
+  if(String(d.queueId)!==qQueueId||d.total!==qTotal){loadQueueAround();return;}
+  var id=String(d.currentTrackId||'');
+  if(id===qCurrentId)return;
+  qCurrentId=id;
+  var target=d.currentIndex-qStart;
+  if(id&&target>=0&&target<qBody.children.length){qCurrentRel=target;markCurrent(id);}
+  else{loadQueueAround();}
 }
 function markCurrent(id){
   var rows=qBody.querySelectorAll('.qrow');
@@ -1344,14 +1519,15 @@ function loadQueueSide(prev){
     })
     .catch(function(){qLoading=false;});
 }
-function flashHint(msg){
-  var old=$('qToast');
+function flashHint(msg,neutral,host){
+  var box=host||qPanel;
+  var old=box.querySelector('.qToast');
   if(old&&old.parentNode)old.parentNode.removeChild(old);
   var el=document.createElement('div');
-  el.id='qToast';
+  el.className='qToast';
   el.style.cssText='position:absolute;left:50%;bottom:28px;transform:translateX(-50%);background:'+(neutral?'rgba(40,44,52,.94)':'rgba(224,83,83,.92)')+';color:'+(neutral?'var(--text)':'#fff')+';font-size:12px;padding:8px 16px;border-radius:999px;z-index:9;max-width:82%;text-align:center';
   el.textContent=msg;
-  qPanel.appendChild(el);
+  box.appendChild(el);
   setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el);},2600);
 }
 $('queueBtn').addEventListener('click',tapOnce(function(){buzz();openQueue();}));
@@ -1362,7 +1538,194 @@ qBody.addEventListener('scroll',function(){
   if(qBody.scrollTop+qBody.clientHeight>=qBody.scrollHeight-80){loadQueueSide(false);return;}
   if(qBody.scrollTop<60){loadQueueSide(true);}
 },{passive:true});
-setInterval(refresh,500);refresh();requestAnimationFrame(raf);
+// ---- 歌词面板 ----
+// 歌词正文只在「打开面板」与「换歌 / 歌词就绪」时各拉一次;
+// 当前行高亮完全由本地播放时钟推算(rAF 节流 200ms),不依赖 2s 轮询,切行跟手且不会跳。
+// 够宽就把歌词贴在封面右侧,不够宽(窄屏手机竖屏)用全屏面板。
+// 纯按宽度判定,不看 orientation:手机横屏宽 844/896 也算够宽,一样并排。
+// 门槛 640px 是「两边还塞得下」的底线(封面列 min(400px,42vw) + 歌词列 + 间距 26px)。
+// 这里是判定「够宽」的唯一出处;CSS 只认 body.lyric-side,不做媒体查询,避免两处判定漂移。
+var LYRIC_WIDE='(min-width:640px)';
+var lPanel=$('lyricPanel'),lPane=$('lyricPane'),lBody=$('lyricBody');
+var lLines=[],lTimes=[],lOffset=0,lHash='',lRawTotal=0,lIndex=-1,lOpen=false,lLoading=false;
+var lFollow=true,lTimer=null,lTickAt=0,lTrackId='',lSideOn=false;
+function lyricWide(){try{return window.matchMedia(LYRIC_WIDE).matches;}catch(e){return false;}}
+// 决定歌词这次挂在哪儿:够宽就挂进右列(由 CSS 把 .lyric-pane 拆成 display:contents,
+// 标题栏绝对定位在列顶、.sbody 自己滚动);否则塞回全屏面板。
+// 节点用 appendChild 搬移而不是复制两份 DOM,事件监听与元素引用都跟着走。
+function routeLyric(){
+  var wide=lyricWide();
+  if(lPane.parentNode!==(wide?$('lyricSide'):lPanel)){
+    (wide?$('lyricSide'):lPanel).appendChild(lPane);
+  }
+  lPanel.classList.toggle('show',!wide);
+  document.body.classList.toggle('lyric-side',wide);
+  if(lSideOn!==wide){lSideOn=wide;lIndex=-1;syncLyricPad();lyricTick(0,true);}
+}
+function openLyric(){
+  closeSearch();closeQueue();
+  lOpen=true;lFollow=true;
+  routeLyric();
+  // 面板刚显示出来时容器还没有高度,留白要等下一帧量才准
+  requestAnimationFrame(syncLyricPad);
+  loadLyric();
+  startLyricSync();
+}
+function closeLyric(){
+  if(!lOpen&&!lPanel.classList.contains('show')&&!document.body.classList.contains('lyric-side'))return;
+  lOpen=false;
+  stopLyricSync();
+  lPanel.classList.remove('show');
+  document.body.classList.remove('lyric-side');
+  refresh();
+}
+function startLyricSync(){wantLyric=true;syncSubs();}
+function stopLyricSync(){wantLyric=false;syncSubs();}
+// HTTP 兜底轮询(桥不支持 WS 时才走);WS 模式下由桥的 lyricMeta 推送驱动
+function lyricSync(){
+  fetch('/api/lyric?meta=1'+qs,{cache:'no-store'})
+    .then(function(r){return r.json();})
+    .then(lyricMetaIn)
+    .catch(function(){});
+}
+// 只做「是否需要重新拉正文」的判断:换歌(hash 变)或歌词从加载中变为就绪(total 变)
+function lyricMetaIn(d){
+  if(!d||!d.ok||!d.meta)return;
+  lOffset=d.timeOffset||0;
+  if(String(d.hash)!==lHash||Number(d.total)!==lRawTotal){loadLyric();}
+}
+function loadLyric(){
+  if(lLoading)return;
+  lLoading=true;
+  fetch('/api/lyric'+qs,{cache:'no-store'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      lLoading=false;
+      if(!d.ok){renderLyricNote(d.error||'读取歌词失败');return;}
+      lHash=String(d.hash||'');
+      lOffset=d.timeOffset||0;
+      lRawTotal=Number(d.total)||0;
+      lLines=d.lines||[];
+      lTimes=[];
+      for(var i=0;i<lLines.length;i++){lTimes.push(Number(lLines[i].time)||0);}
+      if(!lLines.length){renderLyricNote(d.tips||'暂无歌词');return;}
+      renderLyricLines();
+    })
+    .catch(function(){lLoading=false;renderLyricNote('读取歌词失败,请检查与电脑的连接');});
+}
+function renderLyricNote(msg){
+  lIndex=-1;lLines=[];lTimes=[];
+  lBody.innerHTML='<div class="lnote">'+esc(msg)+'</div>';
+}
+function renderLyricLines(){
+  var frag=document.createDocumentFragment();
+  for(var i=0;i<lLines.length;i++){
+    var line=lLines[i];
+    var row=document.createElement('div');
+    row.className='lrow';
+    row.innerHTML=esc(line.text)+(line.translated?'<span class="lsub">'+esc(line.translated)+'</span>':'');
+    frag.appendChild(row);
+  }
+  lBody.innerHTML='';
+  lBody.appendChild(frag);
+  lIndex=-1;
+  lFollow=true;
+  // 换过滚动容器(全屏面板 <-> 并排右列)再渲染新行时,老的 scrollTop 会残留,
+  // 导致首屏当前行不在视野里。这里显式归零,再由 lyricTick 逐行居中。
+  setLyricScroll(0);
+  lyricTick(0,true);
+}
+// 二分找最后一个 time <= t 的行(歌词按 time 升序)
+function lyricIndexAt(t){
+  var lo=0,hi=lTimes.length-1,res=-1;
+  while(lo<=hi){var mid=(lo+hi)>>1;if(lTimes[mid]<=t){res=mid;lo=mid+1;}else{hi=mid-1;}}
+  return res;
+}
+function lyricTick(ts,instant){
+  if(!lOpen||!lTimes.length)return;
+  if(!instant&&ts-lTickAt<200)return;
+  lTickAt=ts||0;
+  var p=state&&state.playback;
+  if(!p){setLyricIndex(-1,false);return;}
+  var t=displayTime>=0?displayTime:(Number(p.currentTime)||0);
+  setLyricIndex(lyricIndexAt(t+lOffset/1000),!instant);
+}
+function setLyricIndex(i,smooth){
+  if(i===lIndex)return;
+  var rows=lBody.children;
+  if(rows[lIndex])rows[lIndex].classList.remove('cur');
+  lIndex=i;
+  var row=rows[i];
+  if(!row)return;
+  row.classList.add('cur');
+  if(lFollow)scrollLyricTo(row,smooth);
+}
+// 歌词的滚动容器在两种形态下其实是同一个节点:.sbody(通用列表容器,自带 flex:1 + overflow:auto)。
+//   窄屏 -> .sbody 直接在 .lyric-pane 里,标题栏在外层不滚
+//   并排 -> .sbody 被绝对定位到标题栏下方并自己滚动(标题栏 absolute,列本身 overflow:hidden)
+// 两种形态都由 #lyricBody 承载滚动,所以这里直接返回它;写死成函数是为了留一个统一出处,
+// 以后若再改布局,只需改这里而不是散落在滚动/留白/复位三处。
+function lyricScroller(){
+  return lBody;
+}
+// 首尾留白:留白要挂在真正的滚动容器上,宽度不一的容器(vh / 百分比)算出来都会偏,
+// 所以统一按容器实测高度写一个 --lpad。
+function syncLyricPad(){
+  var sc=lyricScroller();
+  if(!sc)return;
+  var pad=Math.round(sc.clientHeight*0.45);
+  // 两种形态的留白都挂在 .sbody(= lBody)上,由 CSS 里带 body.lyric-side 前缀的规则覆盖值
+  lBody.style.setProperty('--lpad',pad+'px');
+}
+function setLyricScroll(top){
+  var sc=lyricScroller();
+  if(sc)sc.scrollTop=top;
+}
+// row 的 offsetTop 相对 offsetParent,而 offsetParent 未必就是滚动容器,
+// 用 getBoundingClientRect 折算:两坐标都含当前 scrollTop,结果是滚动容器坐标,两种形态共用一套算法。
+function scrollLyricTo(row,smooth){
+  var sc=lyricScroller();
+  if(!sc)return;
+  syncLyricPad();
+  var scTop=sc.getBoundingClientRect().top;
+  var cur=sc.scrollTop;
+  var rowTop=row.getBoundingClientRect().top-scTop+cur;
+  var top=Math.max(0,rowTop-(sc.clientHeight/2)+(row.offsetHeight/2));
+  if(smooth&&typeof sc.scrollTo==='function'){
+    try{sc.scrollTo({top:top,behavior:'smooth'});}catch(e){sc.scrollTop=top;}
+  }else{
+    sc.scrollTop=top;
+  }
+}
+// 顶部定位按钮:手动翻过歌词后靠它回到当前行并恢复跟随
+function locateLyric(){
+  lFollow=true;
+  if(lIndex<0){flashHint('当前没有在播放的歌曲',true,lPanel);return;}
+  var row=lBody.children[lIndex];
+  if(!row)return;
+  scrollLyricTo(row,true);
+  flashRow(row);
+}
+// 只有真正拖动/滚轮才暂停自动跟随(程序化滚动不会触发这两个事件)
+lBody.addEventListener('touchmove',function(){lFollow=false;},{passive:true});
+lBody.addEventListener('wheel',function(){lFollow=false;},{passive:true});
+// 窗口尺寸跨过阈值时,歌词在「封面右侧 / 全屏面板」之间就地换位
+(function(){
+  var mq=null;
+  try{mq=window.matchMedia(LYRIC_WIDE);}catch(e){return;}
+  var onChange=function(){if(lOpen)routeLyric();};
+  if(mq.addEventListener){mq.addEventListener('change',onChange);}
+  else if(mq.addListener){mq.addListener(onChange);}
+})();
+$('lyricBtn').addEventListener('click',tapOnce(function(){
+  buzz();
+  // 贴在封面旁时再点一次即收起(全屏面板另有「关闭」按钮)
+  if(lOpen&&document.body.classList.contains('lyric-side')){closeLyric();return;}
+  openLyric();
+}));
+$('lyricCancel').addEventListener('click',function(){closeLyric();});
+$('lyricLocate').addEventListener('click',tapOnce(function(){buzz();locateLyric();}));
+refresh();fallbackPoll(true);wsConnect();requestAnimationFrame(raf);
 </script>
 </body>
 </html>`;
