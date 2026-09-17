@@ -750,7 +750,7 @@ async function runCommand(cmd) {
     case "next": ctx.player.next(); break;
     case "prev": ctx.player.prev(); break;
     case "seek": ctx.player.seek(clampNumber(cmd.time, 0, 86400, 0)); break;
-    case "volume": ctx.player.setVolume(clampNumber(cmd.volume, 0, 100, 100) / 100); break;
+    case "volume": ctx.player.setVolume(clampNumber(cmd.volume, 0, 100, 100)); break;
     case "playMode": {
       const mode = String(cmd.mode || "");
       if (PLAY_MODES.includes(mode)) ctx.player.setPlayMode(mode);
