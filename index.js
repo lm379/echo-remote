@@ -1005,11 +1005,16 @@ body.lyric-side .wrap{flex-direction:row;align-items:center;gap:clamp(12px,2.4vw
    剩下给歌词列,窄屏时自动收窄,不会把封面挤成条。 */
 body.lyric-side .col-main{display:flex;flex-direction:column;align-items:center;gap:14px;width:min(400px,38vw);flex:none;max-height:calc(100vh - 16px);overflow-y:auto;overscroll-behavior:contain;padding:2px}
 body.lyric-side .cover{width:min(300px,30vh,86%)}
-/* 并排右列:外层只负责画底色和定高,不滚动;内部拆成「固定标题栏 + 独立滚动正文」两层。
+/* 并排右列:外层只负责定高和裁剪,不画底色——歌词区直接透出 .bg 的封面动态背景;也不滚动。
+   内部拆成「固定标题栏 + 独立滚动正文」两层。
    不要用 overflow 外层 + sticky 标题栏:sticky 的吸附基准是最近的滚动祖先,
    中间隔一层 display:contents 时吸附位置不可靠,标题栏会浮到内容中间压住歌词。 */
-body.lyric-side .col-lyric{position:relative;display:block;flex:1;min-width:0;height:calc(100vh - 16px);max-height:900px;background:rgba(15,17,21,.5);border-radius:20px;overflow:hidden}
-body.lyric-side .col-lyric .sbar{position:absolute;top:0;left:0;right:0;z-index:2;padding:14px 14px 8px;background:linear-gradient(180deg,rgba(11,14,18,.97),rgba(11,14,18,.9) 78%,rgba(11,14,18,0))}
+body.lyric-side .col-lyric{position:relative;display:block;flex:1;min-width:0;height:calc(100vh - 16px);max-height:900px;overflow:hidden}
+/* 标题栏(lyricBar)只负责定位,不画任何底色/渐变遮罩:
+   原先这里有一条 rgba(11,14,18,.97)→透明的深色渐变,在已经透明的右列上就是一条明显的暗带,
+   歌词区永远沉浸不下去。现在整条栏直接透出 .bg 的封面动态背景。
+   按钮 .sbtn 的底色是 rgba(255,255,255,.06) 的半透玻璃,压在动态背景上不突兀,保留。 */
+body.lyric-side .col-lyric .sbar{position:absolute;top:0;left:0;right:0;z-index:2;padding:14px 14px 8px;background:none}
 /* 正文本体负责滚动,并从标题栏下方开始。
    注意:基础 .sbody 是 position:relative,这里改成 absolute 后必须把四边重新钉死,
    否则绝对定位元素会按内容撑高(clientHeight === scrollHeight),看着「有 overflow:auto」
