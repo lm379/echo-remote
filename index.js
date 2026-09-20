@@ -1089,21 +1089,28 @@ body.lyric-side .col-lyric .sbody#lyricBody{padding-top:var(--lpad,45vh);padding
 <script>
 var qs='';
 var state=null,seeking=false,volDragging=false,lastCoverKey='',online=false,displayTime=-1;
+// 进度锚点:以宿主推送的真实 currentTime 为基准,在两次推送(≈500ms)之间做平滑外推。
+// anchorAt=收到该次推送的本地时刻;raf 用它按真实流逝时长推进,而不是无脑猜播放状态。
+var anchorTime=0,anchorAt=0,anchorRate=1,anchorPlaying=false;
 var MODES=['sequential','list','random','single'];
 var MODE_LABELS={sequential:'顺序播放',list:'列表循环',random:'随机播放',single:'单曲循环'};
 var ICON_PLAY='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
 var ICON_PAUSE='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>';
 function $(id){return document.getElementById(id);}
 function fmt(s){if(!isFinite(s))s=0;s=Math.max(0,Math.floor(s));var m=Math.floor(s/60),sec=s%60;return m+':'+(sec<10?'0':'')+sec;}
-function estTime(){var p=state&&state.playback;if(!p)return 0;var t=p.currentTime||0;if(p.isPlaying)t+=(Date.now()-p.updatedAt)/1000*(p.playbackRate||1);if(p.duration>0)t=Math.min(t,p.duration);return t;}
+// 进度锚点同步:每次宿主推送都直接跟随真实 currentTime(可上可下)。
+// 修复点:
+//  1) 宿主回溯/seek 时 displayTime 必须能往下跟 —— 直接取宿主 currentTime,不再做 Math.max 单调下限;
+//  2) 宿主卡顿/缓冲时本地不能无脑按墙钟前进 —— 下个推送(≈500ms)会把锚点拉回真实值,进度不会跑飞
+//     (仅在推送间隔内有 ≤500ms 的轻微前探,随后即被纠正)。
 function syncClock(){
   var p=state&&state.playback;
   if(!p||p.duration<=0){displayTime=-1;return;}
-  var est=estTime();
-  // 只有初始、切歌或超过 2 秒的大跳变才直接跟随服务器,否则只做单调下限,杜绝进度条回退
-  if(displayTime<0||est-displayTime>2){displayTime=est;}
-  else{displayTime=Math.max(displayTime,est);}
-  displayTime=Math.min(Math.max(displayTime,0),p.duration);
+  anchorTime=p.currentTime||0;
+  anchorAt=Date.now();
+  anchorRate=p.playbackRate||1;
+  anchorPlaying=!!p.isPlaying;
+  displayTime=Math.min(Math.max(anchorTime,0),p.duration);
 }
 function buzz(ms){try{if(navigator.vibrate){navigator.vibrate(ms||8);}}catch(e){}}
 var lastTap=0;
@@ -1223,16 +1230,14 @@ function quickRefresh(){
 function refresh(){
   fetch('/api/state'+qs,{cache:'no-store'}).then(function(r){return r.json();}).then(function(s){state=s;setOnline(true);render();}).catch(function(){setOnline(false);});
 }
-var lastFrameTs=0;
 function raf(ts){
-  if(!lastFrameTs){lastFrameTs=ts;}
-  var dt=Math.min(ts-lastFrameTs,250);
-  lastFrameTs=ts;
   var p=state&&state.playback;
-  if(p&&p.isPlaying&&p.duration>0&&!seeking&&displayTime>=0){
-    displayTime=Math.min(displayTime+dt/1000*(p.playbackRate||1),p.duration);
-  }
-  if(p&&!seeking&&p.duration>0&&displayTime>=0){
+  // 平滑外推:以宿主真实进度为锚,按真实流逝时长推进,不依赖本地对播放状态的猜测。
+  // 宿主卡顿(<500ms 间隔的轻微前探会被下个推送纠正)、回溯(锚点直接下跳)都能正确处理。
+  if(p&&p.duration>0&&!seeking&&displayTime>=0){
+    var t=anchorTime+(anchorPlaying?(Date.now()-anchorAt)/1000*anchorRate:0);
+    t=Math.min(Math.max(t,0),p.duration);
+    displayTime=t;
     var el=$('seek');
     el.value=displayTime;
     $('cur').textContent=fmt(displayTime);
@@ -1246,6 +1251,7 @@ $('toggle').addEventListener('click',tapOnce(function(){
     state.playback.isPlaying=!state.playback.isPlaying;
     state.playback.updatedAt=Date.now();
     state.playback.currentTime=displayTime>=0?Math.min(displayTime,state.playback.duration||displayTime):state.playback.currentTime;
+    anchorPlaying=state.playback.isPlaying;anchorAt=Date.now();
   }
   renderPlayBtn();
   buzz();
@@ -1256,7 +1262,7 @@ $('next').addEventListener('click',tapOnce(function(){buzz();post('next');}));
 var seekEl=$('seek');
 var timesEl=document.querySelector('.times');
 seekEl.addEventListener('input',function(){seeking=true;timesEl.classList.add('drag');$('cur').textContent=fmt(parseFloat(seekEl.value));paint(seekEl,parseFloat(seekEl.value)/parseFloat(seekEl.max)*100);});
-seekEl.addEventListener('change',function(){seeking=false;timesEl.classList.remove('drag');var t=parseFloat(seekEl.value);displayTime=t;buzz(15);post('seek',{time:t});});
+seekEl.addEventListener('change',function(){seeking=false;timesEl.classList.remove('drag');var t=parseFloat(seekEl.value);displayTime=t;anchorTime=t;anchorAt=Date.now();buzz(15);post('seek',{time:t});});
 var volEl=$('vol');
 var volLastSent=0;
 function sendVolume(v){volLastSent=Date.now();post('volume',{volume:Number(v)},{noRefresh:true});}
@@ -1276,7 +1282,7 @@ volEl.addEventListener('change',function(){
   sendVolume(Number(volEl.value));
 });
 $('modeBtn').addEventListener('click',tapOnce(function(){var cur=state&&state.playMode?state.playMode:'list';var i=MODES.indexOf(cur);var next=MODES[(i+1)%MODES.length];$('modeBtn').textContent=MODE_LABELS[next];buzz();post('playMode',{mode:next});}));
-$('rateBtn').addEventListener('click',tapOnce(function(){var rates=[0.5,0.75,1,1.25,1.5,2,3];var cur=state&&state.playback?state.playback.playbackRate:1;var i=rates.indexOf(cur);var next=rates[(i+1)%rates.length];$('rateBtn').textContent=next.toFixed(2).replace(/\.?0+$/,'')+'x';buzz();post('rate',{rate:next});}));
+$('rateBtn').addEventListener('click',tapOnce(function(){var rates=[0.5,0.75,1,1.25,1.5,2,3];var cur=state&&state.playback?state.playback.playbackRate:1;var i=rates.indexOf(cur);var next=rates[(i+1)%rates.length];$('rateBtn').textContent=next.toFixed(2).replace(/\.?0+$/,'')+'x';buzz();anchorRate=next;anchorAt=Date.now();post('rate',{rate:next});}));
 if('mediaSession' in navigator&&navigator.mediaSession){
   try{
     navigator.mediaSession.setActionHandler('play',function(){post('play');});
